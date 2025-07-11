@@ -1,0 +1,43 @@
+{
+  "LaunchTemplateName": "vss-spot-template",
+  "LaunchTemplateData": {
+    "ImageId": "ami-0c7217cdde317cfec",
+    "InstanceType": "g4dn.xlarge",
+    "KeyName": "YOUR_KEY_PAIR_NAME",
+    "SecurityGroupIds": ["sg-YOUR_SECURITY_GROUP_ID"],
+    "SubnetId": "subnet-YOUR_SUBNET_ID",
+    "IamInstanceProfile": {
+      "Name": "EC2SpotInstanceProfile"
+    },
+    "BlockDeviceMappings": [
+      {
+        "DeviceName": "/dev/sda1",
+        "Ebs": {
+          "VolumeSize": 100,
+          "VolumeType": "gp3",
+          "DeleteOnTermination": true
+        }
+      }
+    ],
+    "UserData": "",
+    "TagSpecifications": [
+      {
+        "ResourceType": "instance",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "VSS-Spot-Instance"
+          },
+          {
+            "Key": "Project",
+            "Value": "Talentora-POC"
+          },
+          {
+            "Key": "AutoShutdown",
+            "Value": "3AM-EST"
+          }
+        ]
+      }
+    ]
+  }
+} 

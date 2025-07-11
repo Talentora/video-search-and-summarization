@@ -1,0 +1,28 @@
+{
+  "StartRule": {
+    "Name": "start-vss-spot-instance",
+    "Description": "Start VSS spot instance at 8 PM EST daily",
+    "ScheduleExpression": "cron(0 1 * * ? *)",
+    "State": "ENABLED",
+    "Targets": [
+      {
+        "Id": "1",
+        "Arn": "arn:aws:lambda:us-east-1:YOUR_ACCOUNT_ID:function:LaunchVSSSpotInstance",
+        "RoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/EventBridgeExecutionRole"
+      }
+    ]
+  },
+  "StopRule": {
+    "Name": "stop-vss-spot-instance",
+    "Description": "Stop VSS spot instance at 3 AM EST daily",
+    "ScheduleExpression": "cron(0 8 * * ? *)",
+    "State": "ENABLED",
+    "Targets": [
+      {
+        "Id": "1",
+        "Arn": "arn:aws:lambda:us-east-1:YOUR_ACCOUNT_ID:function:TerminateVSSSpotInstance",
+        "RoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/EventBridgeExecutionRole"
+      }
+    ]
+  }
+} 
