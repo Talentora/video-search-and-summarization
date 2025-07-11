@@ -1308,7 +1308,7 @@ def build_summarization(args, app_cfg, logger_):
                         precision=0,
                         minimum=0,
                         maximum=128,
-                        value=0,
+                        value=int(os.environ.get("VLM_DEFAULT_NUM_FRAMES_PER_CHUNK", "0")),
                         info=("The number of frames to choose from chunk"),
                         elem_classes="white-background",
                     )
@@ -1318,7 +1318,7 @@ def build_summarization(args, app_cfg, logger_):
                         precision=0,
                         minimum=0,
                         maximum=4096,
-                        value=0,
+                        value=int(os.environ.get("VLM_INPUT_WIDTH", "0")),
                         info=("Provide VLM frame's width details"),
                         elem_classes="white-background",
                     )
@@ -1328,7 +1328,7 @@ def build_summarization(args, app_cfg, logger_):
                         precision=0,
                         minimum=0,
                         maximum=4096,
-                        value=0,
+                        value=int(os.environ.get("VLM_INPUT_HEIGHT", "0")),
                         info=("Provide VLM frame's height details"),
                         elem_classes="white-background",
                     )

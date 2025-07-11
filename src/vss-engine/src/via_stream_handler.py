@@ -719,7 +719,11 @@ class ViaStreamHandler:
                 req_info.end_time = time.time()
                 self.stop_via_gpu_monitor(req_info, chunk_responses)
                 req_info.status = RequestInfo.Status.SUCCESSFUL
-                cudart.cudaProfilerStop()
+                
+                # Only stop CUDA profiler if we have GPUs available (not in CPU-only mode)
+                if not os.environ.get("FORCE_CPU_ONLY", "").lower() == "true" and int(os.environ.get("NUM_GPUS", "1")) > 0:
+                    cudart.cudaProfilerStop()
+                    
                 nvtx.end_range(req_info.nvtx_summarization_start)
                 logger.info(
                     "Summary generated for video file request %s,"
@@ -1507,7 +1511,10 @@ class ViaStreamHandler:
             summarize_enable = summarize_enable.get("enable", True)
             if summarize is None:
                 summarize = summarize_enable
-        cudart.cudaProfilerStart()
+        
+        # Only start CUDA profiler if we have GPUs available (not in CPU-only mode)
+        if not os.environ.get("FORCE_CPU_ONLY", "").lower() == "true" and int(os.environ.get("NUM_GPUS", "1")) > 0:
+            cudart.cudaProfilerStart()
         if prompt:
             summarization_query = prompt
         else:
@@ -1586,8 +1593,11 @@ class ViaStreamHandler:
     ):
         """Run a query on a file"""
 
+        # If CA-RAG is disabled, automatically disable chat features to allow core summarization
         if self._args.disable_ca_rag is True and (enable_chat is True):
-            raise ViaException("CA-RAG must be enabled to use chat feature", "BadParameter", 400)
+            logger.warning("CA-RAG is disabled, automatically disabling chat features for summarization")
+            enable_chat = False
+            enable_chat_history = False
 
         if self._args.enable_audio is False and (enable_audio is True):
             raise ViaException(

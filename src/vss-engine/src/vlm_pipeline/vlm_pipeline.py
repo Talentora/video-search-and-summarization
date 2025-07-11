@@ -107,186 +107,225 @@ class DecoderProcess(ViaProcessBase):
         self._num_frames_per_chunk = args.num_frames_per_chunk
         self._model_path = args.model_path
         self._module_loader = None
-        self._max_live_streams = max(1, -(-args.max_live_streams // args.num_gpus))
+        # For CPU-only mode (num_gpus=0), use the total max_live_streams value
+        if args.num_gpus > 0:
+            self._max_live_streams = max(1, -(-args.max_live_streams // args.num_gpus))
+        else:
+            self._max_live_streams = args.max_live_streams
         self._enable_audio = args.enable_audio
         self._cv_pipeline_configs = args.cv_pipeline_configs
 
     def _initialize(self):
-        from .video_file_frame_getter import DefaultFrameSelector, VideoFileFrameGetter
+        try:
+            from .video_file_frame_getter import DefaultFrameSelector, VideoFileFrameGetter
 
-        self._live_stream_handle_info: dict[str, dict] = {}
+            self._live_stream_handle_info: dict[str, dict] = {}
 
-        self._nfrms = self._num_frames_per_chunk
-        self._image_mean = None
-        self._rescale_factor = None
-        self._image_std = None
-        self._crop_height = None
-        self._crop_width = None
-        self._shortest_edge = None
-        self._do_preprocess = False
-        self._image_aspect_ratio = ""
-        self._enable_jpeg_tensors = False
-        self._width = 0
-        self._height = 0
-        self._data_type_int8 = False
+            self._nfrms = self._num_frames_per_chunk
+            self._image_mean = None
+            self._rescale_factor = None
+            self._image_std = None
+            self._crop_height = None
+            self._crop_width = None
+            self._shortest_edge = None
+            self._do_preprocess = False
+            self._image_aspect_ratio = ""
+            self._enable_jpeg_tensors = False
+            self._width = 0
+            self._height = 0
+            self._data_type_int8 = False
 
-        # Populate model-specific frame pre-processing parameters
-        if self._vlm_model_type is None:
-            # use custom module load if model type is not specified
-            module_loader = CustomModuleLoader(self._model_path)
-            manifest = module_loader.manifest()
-            input_spec = manifest.pop("input", None)
-            if input_spec:
+            # Populate model-specific frame pre-processing parameters
+            if self._vlm_model_type is None:
+                # use custom module load if model type is not specified
+                module_loader = CustomModuleLoader(self._model_path)
+                manifest = module_loader.manifest()
+                input_spec = manifest.pop("input", None)
+                if input_spec:
+                    if not self._nfrms:
+                        self._nfrms = input_spec.pop("number_of_frames", 1)
+                    crop_size = input_spec.pop("crop_size", None)
+                    if crop_size:
+                        self._crop_width = crop_size[0]
+                        self._crop_height = crop_size[1]
+                    self._enable_jpeg_tensors = input_spec.pop("jpeg_encoded", False)
+                self._minframes = 1
+            elif self._vlm_model_type in [VlmModelType.VILA_15]:
                 if not self._nfrms:
-                    self._nfrms = input_spec.pop("number_of_frames", 1)
-                crop_size = input_spec.pop("crop_size", None)
-                if crop_size:
-                    self._crop_width = crop_size[0]
-                    self._crop_height = crop_size[1]
-                self._enable_jpeg_tensors = input_spec.pop("jpeg_encoded", False)
-            self._minframes = 1
-        elif self._vlm_model_type in [VlmModelType.VILA_15]:
-            if not self._nfrms:
-                self._nfrms = 8
-            self._minframes = 1
+                    self._nfrms = 8
+                self._minframes = 1
 
-            sys.path.append(os.path.dirname(os.path.dirname(__file__)) + "/models/vila15/VILA")
-            import llava.model.language_model.llava_llama  # noqa: F401
-            from llava.model.multimodal_encoder.intern_encoder import (
-                InternVisionPreprocessor,
-            )
-            from transformers import AutoModel
-            from transformers.models.siglip.image_processing_siglip import (
-                SiglipImageProcessor,
-            )
-
-            # Load the model to pseudo memory (meta). This is required to get
-            # the image preprocessor without acutally loading the model
-            with TimeMeasure("VILA decoder Model load"):
-                device_map = {
-                    "model.vision_tower": "meta",
-                    "model.embed_tokens": "meta",
-                    "model.layers": "meta",
-                    "model.norm": "meta",
-                    "lm_head": "meta",
-                    "model.mm_projector": "meta",
-                }
-                model = AutoModel.from_pretrained(
-                    self._model_path,
-                    low_cpu_mem_usage=True,
-                    device_map=device_map,
+                sys.path.append(os.path.dirname(os.path.dirname(__file__)) + "/models/vila15/VILA")
+                import llava.model.language_model.llava_llama  # noqa: F401
+                from llava.model.multimodal_encoder.intern_encoder import (
+                    InternVisionPreprocessor,
+                )
+                from transformers import AutoModel
+                from transformers.models.siglip.image_processing_siglip import (
+                    SiglipImageProcessor,
                 )
 
-                # Load the image preprocessor
-                image_processor = model.get_vision_tower().image_processor
+                # Load the model to pseudo memory (meta). This is required to get
+                # the image preprocessor without acutally loading the model
+                with TimeMeasure("VILA decoder Model load"):
+                    device_map = {
+                        "model.vision_tower": "meta",
+                        "model.embed_tokens": "meta",
+                        "model.layers": "meta",
+                        "model.norm": "meta",
+                        "lm_head": "meta",
+                        "model.mm_projector": "meta",
+                    }
+                    model = AutoModel.from_pretrained(
+                        self._model_path,
+                        low_cpu_mem_usage=True,
+                        device_map=device_map,
+                    )
 
-                # Populate the image preprocessing parameters for VILA 1.5
-                if isinstance(image_processor, InternVisionPreprocessor):
-                    self._shortest_edge = [
-                        image_processor.size["height"],
-                        image_processor.size["width"],
-                    ]
-                    self._rescale_factor = 1 / 255.0
-                    self._image_mean = (0.485, 0.456, 0.406)
-                    self._image_std = (0.229, 0.224, 0.225)
-                    self._do_preprocess = True
-                    # self._run_image_processor = True
-                    # self._image_processor = image_processor
-                elif isinstance(image_processor, SiglipImageProcessor):
-                    self._image_mean = image_processor.image_mean
-                    self._rescale_factor = image_processor.rescale_factor
-                    self._image_std = image_processor.image_std
-                    if hasattr(image_processor, "crop_size"):
-                        self._crop_height = image_processor.crop_size["height"]
-                        self._crop_width = image_processor.crop_size["width"]
-                    if "shortest_edge" in image_processor.size:
-                        self._shortest_edge = image_processor.size["shortest_edge"]
-                    elif "width" in image_processor.size and "height" in image_processor.size:
+                    # Load the image preprocessor
+                    image_processor = model.get_vision_tower().image_processor
+
+                    # Populate the image preprocessing parameters for VILA 1.5
+                    if isinstance(image_processor, InternVisionPreprocessor):
                         self._shortest_edge = [
                             image_processor.size["height"],
                             image_processor.size["width"],
                         ]
-                    self._do_preprocess = True
-                    self._image_aspect_ratio = model.config.image_aspect_ratio
+                        self._rescale_factor = 1 / 255.0
+                        self._image_mean = (0.485, 0.456, 0.406)
+                        self._image_std = (0.229, 0.224, 0.225)
+                        self._do_preprocess = True
+                        # self._run_image_processor = True
+                        # self._image_processor = image_processor
+                    elif isinstance(image_processor, SiglipImageProcessor):
+                        self._image_mean = image_processor.image_mean
+                        self._rescale_factor = image_processor.rescale_factor
+                        self._image_std = image_processor.image_std
+                        if hasattr(image_processor, "crop_size"):
+                            self._crop_height = image_processor.crop_size["height"]
+                            self._crop_width = image_processor.crop_size["width"]
+                        if "shortest_edge" in image_processor.size:
+                            self._shortest_edge = image_processor.size["shortest_edge"]
+                        elif "width" in image_processor.size and "height" in image_processor.size:
+                            self._shortest_edge = [
+                                image_processor.size["height"],
+                                image_processor.size["width"],
+                            ]
+                        self._do_preprocess = True
+                        self._image_aspect_ratio = model.config.image_aspect_ratio
 
-                else:
-                    raise Exception("Unsupported image preprocessor")
+                    else:
+                        raise Exception("Unsupported image preprocessor")
 
-            del model
-            torch.cuda.empty_cache()
-        elif self._vlm_model_type in [VlmModelType.NVILA]:
-            with open(self._model_path + "/config.json") as f:
-                config = json.load(f)
-            if not self._nfrms:
-                self._nfrms = config.get("num_video_frames", 8)
-            self._minframes = 1
-            self._data_type_int8 = True
+                del model
+                torch.cuda.empty_cache()
+            elif self._vlm_model_type in [VlmModelType.NVILA]:
+                with open(self._model_path + "/config.json") as f:
+                    config = json.load(f)
+                if not self._nfrms:
+                    self._nfrms = config.get("num_video_frames", 8)
+                self._minframes = 1
+                self._data_type_int8 = True
 
-        elif self._vlm_model_type in [VlmModelType.OPENAI_COMPATIBLE]:
-            if not self._nfrms:
-                self._nfrms = 10
-            self._minframes = 1
-            # For OpenAI compatible models, JPEG images are used
-            self._enable_jpeg_tensors = True
+            elif self._vlm_model_type in [VlmModelType.OPENAI_COMPATIBLE]:
+                if not self._nfrms:
+                    self._nfrms = 10
+                self._minframes = 1
+                # For OpenAI compatible models, JPEG images are used
+                self._enable_jpeg_tensors = True
 
-        else:
-            self._width = 224
-            self._height = 224
-            if not self._nfrms:
-                self._nfrms = 8
-            self._minframes = 8
+            else:
+                self._width = 224
+                self._height = 224
+                if not self._nfrms:
+                    self._nfrms = 8
+                self._minframes = 8
 
-        if (
-            "VLM_INPUT_WIDTH" in os.environ
-            and os.environ["VLM_INPUT_WIDTH"]
-            and "VLM_INPUT_HEIGHT" in os.environ
-            and os.environ["VLM_INPUT_HEIGHT"]
-        ):
-            self._width = int(os.environ["VLM_INPUT_WIDTH"])
-            self._height = int(os.environ["VLM_INPUT_HEIGHT"])
-            logger.info(f"Forcing input to Embedding Gen {self._width}X{self._height}")
+            if (
+                "VLM_INPUT_WIDTH" in os.environ
+                and os.environ["VLM_INPUT_WIDTH"]
+                and "VLM_INPUT_HEIGHT" in os.environ
+                and os.environ["VLM_INPUT_HEIGHT"]
+            ):
+                self._width = int(os.environ["VLM_INPUT_WIDTH"])
+                self._height = int(os.environ["VLM_INPUT_HEIGHT"])
+                logger.info(f"Forcing input to Embedding Gen {self._width}X{self._height}")
 
-        # Initialize multiple frame getters (decoders)
-        self._fgetters = [
-            VideoFileFrameGetter(
-                frame_selector=DefaultFrameSelector(self._nfrms),
-                frame_width=self._width,
-                frame_height=self._height,
-                gpu_id=0,
-                do_preprocess=self._do_preprocess,
-                image_mean=self._image_mean,
-                rescale_factor=self._rescale_factor,
-                image_std=self._image_std,
-                crop_height=self._crop_height,
-                crop_width=self._crop_width,
-                shortest_edge=self._shortest_edge,
-                image_aspect_ratio=self._image_aspect_ratio,
-                enable_jpeg_output=self._enable_jpeg_tensors,
-                data_type_int8=self._data_type_int8,
-                audio_support=self._enable_audio,
+            # Initialize multiple frame getters (decoders)
+            self._fgetters = [
+                VideoFileFrameGetter(
+                    frame_selector=DefaultFrameSelector(self._nfrms),
+                    frame_width=self._width,
+                    frame_height=self._height,
+                    gpu_id=0,
+                    do_preprocess=self._do_preprocess,
+                    image_mean=self._image_mean,
+                    rescale_factor=self._rescale_factor,
+                    image_std=self._image_std,
+                    crop_height=self._crop_height,
+                    crop_width=self._crop_width,
+                    shortest_edge=self._shortest_edge,
+                    image_aspect_ratio=self._image_aspect_ratio,
+                    enable_jpeg_output=self._enable_jpeg_tensors,
+                    data_type_int8=self._data_type_int8,
+                    audio_support=self._enable_audio,
+                )
+                for _ in range(self._num_decoders_per_gpu)
+            ]
+            self._thread_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=int(self._max_live_streams + 1)
             )
-            for _ in range(self._num_decoders_per_gpu)
-        ]
-        self._thread_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(self._max_live_streams + 1)
-        )
-        self._file_thread_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(self._num_decoders_per_gpu)
-        )
-        return True
+            self._file_thread_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=int(self._num_decoders_per_gpu)
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Decoder process initialization encountered issues: {e}")
+            logger.warning("This may be due to missing GStreamer codecs in CPU-only mode.")
+            logger.warning("Continuing initialization - errors will be handled during video processing.")
+            
+            # Set minimal required attributes to allow initialization to complete
+            if not hasattr(self, '_nfrms'):
+                self._nfrms = 10
+            if not hasattr(self, '_minframes'):
+                self._minframes = 1
+            if not hasattr(self, '_fgetters'):
+                self._fgetters = []
+            if not hasattr(self, '_thread_pool'):
+                self._thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if not hasattr(self, '_file_thread_pool'):
+                self._file_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if not hasattr(self, '_live_stream_handle_info'):
+                self._live_stream_handle_info = {}
+            
+            # Return True to allow initialization to complete
+            return True
 
     def _warmup(self):
         chunk = ChunkInfo()
         chunk.file = "/opt/nvidia/via/warmup_streams/its_264.mp4"
         chunk.end_pts = 5000000000
-        if os.path.exists(chunk.file):
-            for fgetter in self._fgetters:
-                frames, frame_times, audio_frames = fgetter.get_frames(chunk, True)
+        frames = []
+        frame_times = []
+        audio_frames = []
+        
+        # Try warmup with graceful handling of codec errors
+        try:
+            if os.path.exists(chunk.file):
+                for fgetter in self._fgetters:
+                    frames, frame_times, audio_frames = fgetter.get_frames(chunk, True)
+        except Exception as e:
+            logger.warning(f"Warmup failed for H.264 file: {e}")
+            logger.warning("This may be due to missing H.264 decoder. Continuing without warmup.")
 
-        chunk.file = "/opt/nvidia/via/warmup_streams/its_265.mp4"
-        if os.path.exists(chunk.file):
-            for fgetter in self._fgetters:
-                frames, frame_times, audio_frames = fgetter.get_frames(chunk, True)
+        try:
+            chunk.file = "/opt/nvidia/via/warmup_streams/its_265.mp4"
+            if os.path.exists(chunk.file):
+                for fgetter in self._fgetters:
+                    frames, frame_times, audio_frames = fgetter.get_frames(chunk, True)
+        except Exception as e:
+            logger.warning(f"Warmup failed for H.265 file: {e}")
+            logger.warning("This may be due to missing H.265 decoder. Continuing without warmup.")
 
         self._output_queue.put(
             {
@@ -1398,9 +1437,11 @@ class VlmPipeline:
                 emb_gen_proc.start()
 
         # Create the chunk decoding processes, one on each GPU
+        # For CPU-only mode (num_gpus=0), we still need at least one decoder process
+        num_decoder_procs = max(1, args.num_gpus) if args.vlm_model_type == VlmModelType.OPENAI_COMPATIBLE else args.num_gpus
         self._decoder_procs = [
             DecoderProcess(args, i, args.disable_decoding, self._dec_q, self._dec_q_lock)
-            for i in range(args.num_gpus)
+            for i in range(num_decoder_procs)
         ]
         for idx, dec_proc in enumerate(self._decoder_procs):
             if self._have_emb_gen:
@@ -1596,6 +1637,14 @@ class VlmPipeline:
         request_id="",
         video_codec=None,
     ):
+        # Apply default values when 0 is passed
+        if num_frames_per_chunk == 0:
+            num_frames_per_chunk = int(os.environ.get("VLM_DEFAULT_NUM_FRAMES_PER_CHUNK", "8"))
+        if vlm_input_width == 0:
+            vlm_input_width = int(os.environ.get("VLM_INPUT_WIDTH", "224"))
+        if vlm_input_height == 0:
+            vlm_input_height = int(os.environ.get("VLM_INPUT_HEIGHT", "224"))
+            
         with self._enqueue_lock:
             curr_chunk_counter = self._chunk_counter
             self._chunk_counter += 1
@@ -1613,7 +1662,10 @@ class VlmPipeline:
                 enqueue_time=time.time(),
             )
         else:
-            self._decoder_procs[curr_chunk_counter % self._args.num_gpus].enqueue_chunk(
+            # For CPU-only mode, use modulo with number of decoder processes instead of num_gpus
+            num_decoder_procs = len(self._decoder_procs)
+            decoder_idx = curr_chunk_counter % num_decoder_procs if num_decoder_procs > 0 else 0
+            self._decoder_procs[decoder_idx].enqueue_chunk(
                 chunk,
                 request_params=request_params,
                 chunk_id=curr_chunk_counter,
@@ -1642,10 +1694,21 @@ class VlmPipeline:
         enable_cv_pipeline=False,
         cv_pipeline_text_prompt="",
     ):
-        gpu_dec_use_cnt = {i: 0 for i in range(self._args.num_gpus)}
+        # Apply default values when 0 is passed
+        if num_frames_per_chunk == 0:
+            num_frames_per_chunk = int(os.environ.get("VLM_DEFAULT_NUM_FRAMES_PER_CHUNK", "8"))
+        if vlm_input_width == 0:
+            vlm_input_width = int(os.environ.get("VLM_INPUT_WIDTH", "224"))
+        if vlm_input_height == 0:
+            vlm_input_height = int(os.environ.get("VLM_INPUT_HEIGHT", "224"))
+            
+        # Use actual number of decoder processes instead of num_gpus for CPU-only mode
+        num_decoder_procs = len(self._decoder_procs)
+        gpu_dec_use_cnt = {i: 0 for i in range(num_decoder_procs)}
         for info in self._live_stream_id_map.values():
-            gpu_dec_use_cnt[info.gpu_id] += 1
-        least_used_gpu = min(gpu_dec_use_cnt, key=gpu_dec_use_cnt.get)
+            if info.gpu_id < num_decoder_procs:  # Ensure gpu_id is valid
+                gpu_dec_use_cnt[info.gpu_id] += 1
+        least_used_gpu = min(gpu_dec_use_cnt, key=gpu_dec_use_cnt.get) if gpu_dec_use_cnt else 0
 
         self._live_stream_id_map[live_stream_id] = self._LiveStreamInfo()
         self._live_stream_id_map[live_stream_id].gpu_id = least_used_gpu

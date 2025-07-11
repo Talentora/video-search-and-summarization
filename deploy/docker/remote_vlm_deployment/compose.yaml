@@ -17,9 +17,15 @@
 
 services:
   via-server:
-    image: ${VIA_IMAGE:-nvcr.io/nvidia/blueprint/vss-engine:2.3.1}
+    # Use custom image with H.264 decoder dependencies
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vss-engine-cpu-h264:latest
     shm_size: '16gb'
-    runtime: nvidia
+    # Override both entrypoint and command to use our custom startup script
+    entrypoint: ["/bin/bash"]
+    command: ["/tmp/start_via_cpu.sh"]
     ports:
       - "${BACKEND_PORT?}:${BACKEND_PORT?}"
       - "${FRONTEND_PORT?}:${FRONTEND_PORT?}"
@@ -35,9 +41,24 @@ services:
       - "${TRT_ENGINE_PATH:-/dummy}${TRT_ENGINE_PATH:+:${TRT_ENGINE_PATH:-}}"
       - "${GSAM_MODEL_ROOT_DIR:-/dummy}${GSAM_MODEL_ROOT_DIR:+:${GSAM_MODEL_ROOT_DIR:-}}"
       - "${VIA_SRC_DIR:-/dummy}${VIA_SRC_DIR:+:/opt/nvidia/via:ro}"
+      - "${VIA_SRC_DIR_MODIFIED:-/dummy}${VIA_SRC_DIR_MODIFIED:+:/opt/nvidia/via-modified:ro}"
       - "${VIA_LOG_DIR:-/dummy}${VIA_LOG_DIR:+:/tmp/via-logs}"
       - via-hf-cache:/tmp/huggingface
       - "${CV_PIPELINE_TRACKER_CONFIG:-/dummy}${CV_PIPELINE_TRACKER_CONFIG:+:/opt/nvidia/via/config/default_tracker_config.yml}"
+      # Mount our custom startup script
+      - "./start_via_cpu.sh:/tmp/start_via_cpu.sh:ro"
+    depends_on:
+      - graph-db
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
+    ipc: host
+    stdin_open: true
+    tty: true
+    extra_hosts:
+      host.docker.internal: host-gateway
     environment:
       GRAPH_RAG_PROMPT_CONFIG: "${GRAPH_RAG_PROMPT_CONFIG:-}"
       AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY:-}"
@@ -62,6 +83,7 @@ services:
       TRT_ENGINE_PATH: "${TRT_ENGINE_PATH:-}"
       TRT_LLM_MODE: "${TRT_LLM_MODE:-}"
       VIA_VLM_OPENAI_MODEL_DEPLOYMENT_NAME: "${VIA_VLM_OPENAI_MODEL_DEPLOYMENT_NAME:-}"
+      VIA_VLM_ENDPOINT: "${VIA_VLM_ENDPOINT:-}"
       VIA_VLM_API_KEY: "${VIA_VLM_API_KEY:-}"
       VLM_BATCH_SIZE: "${VLM_BATCH_SIZE:-}"
       VLM_MODEL_TO_USE: "${VLM_MODEL_TO_USE:-openai-compat}"
@@ -99,18 +121,6 @@ services:
       VSS_RTSP_TIMEOUT: "${VSS_RTSP_TIMEOUT:-}"
       MAX_RAILS_INSTANCES: "${MAX_RAILS_INSTANCES:-}"
       VLM_DEFAULT_NUM_FRAMES_PER_CHUNK: "${VLM_DEFAULT_NUM_FRAMES_PER_CHUNK:-}"
-    depends_on:
-      - graph-db
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-      stack: 67108864
-    ipc: host
-    stdin_open: true
-    tty: true
-    extra_hosts:
-      host.docker.internal: host-gateway
 
   graph-db:
     restart: always

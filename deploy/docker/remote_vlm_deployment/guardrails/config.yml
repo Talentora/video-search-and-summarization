@@ -18,15 +18,15 @@
 models:
   - type: main
     engine: nim
-    model: meta/llama-3.1-70b-instruct
+    model: gpt-4o
     parameters:
-      base_url: "https://integrate.api.nvidia.com/v1"
+      base_url: "https://api.openai.com/v1"
 
   - type: embeddings
     engine: nim
-    model: nvidia/llama-3.2-nv-embedqa-1b-v2
+    model: text-embedding-3-large
     parameters:
-      base_url: "https://integrate.api.nvidia.com/v1"
+      base_url: "https://api.openai.com/v1"
 
 rails:
   input:

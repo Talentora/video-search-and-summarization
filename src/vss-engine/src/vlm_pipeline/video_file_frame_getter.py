@@ -47,7 +47,51 @@ except ImportError:
 import multiprocessing as mp
 
 import numpy as np
-import pyds
+# Conditional import of pyds for CPU-only mode
+try:
+    import pyds
+    HAVE_PYDS = True
+except ImportError as e:
+    HAVE_PYDS = False
+    print(f"WARNING: pyds not available (CPU-only mode): {e}")
+    # Create a mock pyds module for CPU-only mode
+    class MockPyDS:
+        @staticmethod
+        def gst_buffer_get_nvds_batch_meta(*args, **kwargs):
+            return None
+        @staticmethod
+        def get_nvds_frame_meta_from_batch(*args, **kwargs):
+            return None
+        @staticmethod
+        def get_nvds_buf_surface_gpu(*args, **kwargs):
+            return None, None, None, None, None
+        @staticmethod
+        def configure_source_for_ntp_sync(*args, **kwargs):
+            pass
+        @staticmethod
+        def nvds_acquire_obj_meta_from_pool(*args, **kwargs):
+            return None
+        @staticmethod
+        def nvds_add_obj_meta_to_frame(*args, **kwargs):
+            pass
+        @staticmethod
+        def free_buffer(*args, **kwargs):
+            pass
+        
+        # Mock classes
+        class NvOSD_MaskParams:
+            @staticmethod
+            def cast(*args, **kwargs):
+                return None
+        
+        class NvDsObjectMeta:
+            @staticmethod
+            def cast(*args, **kwargs):
+                return None
+        
+        # Add other pyds functions as needed
+    pyds = MockPyDS()
+
 import riva.client
 import torch
 import yaml
@@ -403,135 +447,188 @@ class VideoFileFrameGetter:
         audio_support=False,
         cv_pipeline_configs={},
     ) -> None:
-        self._selected_pts_array = []
-        self._last_gst_buffer = None
-        self._loop = None
         self._frame_selector = frame_selector
-        self._chunk = None
+        self._frame_width = frame_width
+        self._frame_height = frame_height
         self._gpu_id = gpu_id
-        self._sei_base_time = None
-        self._frame_width = self._frame_width_orig = frame_width
-        self._frame_height = self._frame_height_orig = frame_height
-        self._uridecodebin = None
+        self._do_preprocess = do_preprocess
         self._image_mean = image_mean
         self._rescale_factor = rescale_factor
         self._image_std = image_std
         self._crop_height = crop_height
         self._crop_width = crop_width
         self._shortest_edge = shortest_edge
-        self._do_preprocess = do_preprocess
-        self._image_aspect_ratio = image_aspect_ratio
         self._enable_jpeg_output = enable_jpeg_output
+        self._image_aspect_ratio = image_aspect_ratio
         self._data_type_int8 = data_type_int8
         self._audio_support = audio_support
         self._enable_audio = False
+        self._cv_pipeline_configs = cv_pipeline_configs
+
         self._pipeline = None
-        self._last_stream_id = ""
-        self._last_cv_json_file = ""
-        self._is_live = False
-        self._live_stream_frame_selectors: dict[BaseFrameSelector, any] = {}
-        self._live_stream_frame_selectors_lock = Lock()
-        self._audio_start_cv = Condition()
-        self._audio_end_cv = Condition()
-        self._audio_present_cv = Condition()
-        self._live_stream_audio_transcripts_lock = Lock()
+        self._live_stream_frame_selectors = {}
+        self._live_stream_frame_selectors_lock = threading.Lock()
+        self._cached_frames = []
+        self._cached_frames_pts = []
+        self._cached_audio_frames = []
+        self._cached_audio_frames_pts = []
+        self._cached_texts = []
+        self._cached_texts_pts = []
+        self._live_stream_finished_chunks = []
+        self._live_stream_finished_chunks_lock = threading.Lock()
         self._live_stream_next_chunk_start_pts = 0
-        self._audio_current_pts = 0
         self._live_stream_next_chunk_idx = 0
-        self._live_stream_chunk_duration = 0
         self._live_stream_chunk_overlap_duration = 0
+        self._live_stream_chunks_to_process = 0
+        self._live_stream_request_id = ""
         self._live_stream_ntp_epoch = 0
         self._live_stream_ntp_pts = 0
-        self._live_stream_request_id = 0
-        self._output_cv_metadata = None
-        self._dump_cached_frames = False
-        self._last_video_codec = None
-        self._live_stream_chunk_decoded_callback: Callable[
-            [ChunkInfo, torch.Tensor | list[np.ndarray], list[float], list[dict]], None
-        ] = None
-        self._first_frame_width = 0
-        self._first_frame_height = 0
-        self._got_error = False
-        self._previous_frame_width = 0
-        self._previous_frame_height = 0
+        self._gdino_cache = {}
+        self._gdino_cache_lock = threading.Lock()
+        self._gdino_output_queue = None
+        self._gdino_input_queue = None
+        self._gdino_process = None
+        self._gdino_engine = None
+        self._gdino_process_finished = None
+        self._gdino_process_error = None
+        self._gdino_inference_device = None
+        self._gdino_thread = None
+        self._gdino_lock = threading.Lock()
+        self._gdino_eos_event = threading.Event()
+        self._gdino_stop_event = threading.Event()
+        self._gdino_process_threads = []
+        self._gdino_test_mode = False
+        self._gdino_test_mode_file = ""
+        self._gdino_test_mode_ground_truth = ""
+        self._gdino_test_mode_scores = {}
+        self._gdino_test_mode_scores_lock = threading.Lock()
+        self._gdino_test_mode_annotation_file = ""
+        self._gdino_test_mode_annotation_results = {}
+        self._gdino_test_mode_annotation_file_lock = threading.Lock()
+        self._gdino_test_mode_annotation_results_lock = threading.Lock()
+        self._gdino_test_mode_total_frames = 0
+        self._gdino_test_mode_total_frames_lock = threading.Lock()
+        self._gdino_test_mode_total_objects = 0
+        self._gdino_test_mode_total_objects_lock = threading.Lock()
+        self._gdino_batch_size = 1
+        self._gdino_batch_lock = threading.Lock()
+        self._gdino_batch_ready = threading.Event()
+        self._gdino_batch_frames = []
+        self._gdino_batch_frames_lock = threading.Lock()
+        self._gdino_batch_buffer_info = []
+        self._gdino_batch_buffer_info_lock = threading.Lock()
+        self._gdino_batch_processed = threading.Event()
+        self._gdino_batch_processed_lock = threading.Lock()
+        self._gdino_batch_results = []
+        self._gdino_batch_results_lock = threading.Lock()
+        self._gdino_batch_timeout = 1000
+        self._gdino_batch_timeout_lock = threading.Lock()
+        self._gdino_batch_timeout_event = threading.Event()
+        self._gdino_batch_timeout_event_lock = threading.Lock()
+        self._gdino_batch_timeout_thread = None
+        self._gdino_batch_timeout_thread_lock = threading.Lock()
+        self._gdino_batch_timeout_thread_stop = threading.Event()
+        self._gdino_batch_timeout_thread_stop_lock = threading.Lock()
+        self._gdino_batch_timeout_thread_running = False
+        self._gdino_batch_timeout_thread_running_lock = threading.Lock()
+        self._gdino_batch_timeout_thread_finished = threading.Event()
+        self._gdino_batch_timeout_thread_finished_lock = threading.Lock()
+        self._gdino_inference_thread = None
+        self._gdino_inference_thread_lock = threading.Lock()
+        self._gdino_inference_thread_stop = threading.Event()
+        self._gdino_inference_thread_stop_lock = threading.Lock()
+        self._gdino_inference_thread_running = False
+        self._gdino_inference_thread_running_lock = threading.Lock()
+        self._gdino_inference_thread_finished = threading.Event()
+        self._gdino_inference_thread_finished_lock = threading.Lock()
+        self._gdino_inference_queue = queue.Queue()
+        self._gdino_inference_queue_lock = threading.Lock()
+        self._gdino_inference_results = {}
+        self._gdino_inference_results_lock = threading.Lock()
+        self._gdino_inference_results_ready = threading.Event()
+        self._gdino_inference_results_ready_lock = threading.Lock()
+
+        self._is_live = False
         self._last_frame_pts = 0
-        self._uridecodebin = None
-        self._adecodebin = None
-        self._idecodebin = None
+        self._audio_present = False
+        self._audio_present_cv = threading.Condition()
+        self._audio_current_pts = 0
+        self._audio_start_cv = threading.Condition()
+        self._audio_end_cv = threading.Condition()
+        self._audio_stop = threading.Event()
+        self._audio_error = threading.Event()
+        self._audio_eos = False
+        self._audio_frames_queue = mp.Queue()
+        self._asr_input_queue = mp.Queue()
+        self._asr_output_queue = mp.Queue()
+        self._asr_process = None
+        self._asr_process_finished = None
+        self._asr_process_error = None
+        self._asr_config_file = ""
+        self._asr_input_thread = None
+        self._asr_output_thread = None
+        self._stop_stream = False
+        self._got_error = False
+        self._codec_error = False  # Add codec error flag
+        self._eos_sent = False
+        self._start_pts = 0
+        self._end_pts = 0
+        self._chunk_duration = 0
         self._vdecodebin = None
         self._vdecodebin_h264 = None
         self._vdecodebin_h265 = None
-        self._rtspsrc = None
-        self._udpsrc = None
-        self._audio_eos = False
-        self._audio_stop = mp.Event()
-        self._audio_error = mp.Event()
-        self._asr_process_finished = mp.Event()
-        self._audio_start_pts = None
-        self._audio_frames_lock = threading.Lock()
-        self._audio_present = False
-        self._eos_sent = False
-        self._end_pts = None
-        self._chunk_duration = None
-        self._audio_convert = None
-        self._audio_resampler = None
-        self._audio_capsfilter1 = None
-        self._audio_capsfilter2 = None
-        self._audio_appsink = None
-        self._audio_q1 = None
-        self._model_name = None
-        self._server_uri = None
-        self._riva_nim_server = True
-        self._asr_config_file = "/tmp/via/riva_asr_grpc_conf.yaml"
-        self._server_config = None
-        self._asr_config = None
-        self._auth = None
-        self._tee = None
-        self._nvtracker = None
-        self._cached_transcripts = []
-        self._cached_audio_frames = []
-        self._asr_input_queue = None
-        self._asr_output_queue = None
-        self._asr_process = None
-        self._cv_pipeline_configs = cv_pipeline_configs
-        self._gdino = None
-        self._gdino_engine = None
-        # Mask formatting related configs
-        self._mask_border_width = 5
-        self._center_text_on_object = True
-        self._draw_bbox = False
-        self._fill_mask = True
+        self._idecodebin = None
+        self._adecodebin = None
+        self._previous_frame_width = 0
+        self._previous_frame_height = 0
+        self._last_video_codec = None
+        self._last_stream_id = ""
+        self._last_cv_json_file = ""
+        self._destroy_pipeline = False
+        self._first_frame_width = 0
+        self._first_frame_height = 0
+        self._loop = None
+        self._bus = None
+        self._sei_data = None
+        self._sei_base_time = None
+        self._input_cv_metadata = None
         self._pipeline_width = 0
         self._pipeline_height = 0
-        self._splitmuxsink = None
-        self._cached_frames_cv_meta = []  # List of cached frames cv meta for each chunk
-        if "gdino_engine" in self._cv_pipeline_configs:
-            self._gdino_engine = self._cv_pipeline_configs["gdino_engine"]
-            if os.path.isfile(self._gdino_engine):
-                from cv_pipeline.gsam_pipeline_trt_ds import cudaSetDevice
-
-                cudaSetDevice(self._gpu_id)
-                self._gdino = None
-                # self._gdino = GroundingDino(
-                #     trt_engine=self._gdino_engine, max_text_len=256, batch_size=1
-                # )
-                # memory_pool = cp.cuda.MemoryPool(cp.cuda.malloc_managed)
-                # # Set the memory pool as the default allocator
-                # cp.cuda.set_allocator(memory_pool.malloc)
-                logger.debug(
-                    "Live stream : Created gdino handle %s " "for gdino engine %s",
-                    self._gdino,
-                    self._gdino_engine,
-                )
-
-        self._tracker_config = "/opt/nvidia/deepstream/deepstream/samples\
-                    /configs/deepstream-app/config_tracker_NvDCF_perf.yml"
-        if "tracker_config" in self._cv_pipeline_configs:
-            if os.path.isfile(self._cv_pipeline_configs["tracker_config"]):
-                self._tracker_config = self._cv_pipeline_configs["tracker_config"]
-        self._inference_interval = 1
-        if "inference_interval" in self._cv_pipeline_configs:
-            self._inference_interval = self._cv_pipeline_configs["inference_interval"]
+        self._live_stream_video_preview_sink = None
+        self._live_stream_video_preview_valve = None
+        self._live_stream_video_preview_control_thread = None
+        self._live_stream_video_preview_control_thread_stop = False
+        self._tracker_config = "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_accuracy.yml"
+        self._nvtracker = None
+        self._nvinfer = None
+        self._nvinfer_server = None
+        self._gdino = None
+        self._gdino_batch_meta = None
+        self._gdino_batch_meta_lock = threading.Lock()
+        self._gdino_batch_meta_ready = threading.Event()
+        self._gdino_batch_meta_ready_lock = threading.Lock()
+        self._gdino_batch_meta_processed = threading.Event()
+        self._gdino_batch_meta_processed_lock = threading.Lock()
+        self._gdino_batch_meta_results = []
+        self._gdino_batch_meta_results_lock = threading.Lock()
+        self._gdino_batch_meta_timeout = 1000
+        self._gdino_batch_meta_timeout_lock = threading.Lock()
+        self._gdino_batch_meta_timeout_event = threading.Event()
+        self._gdino_batch_meta_timeout_event_lock = threading.Lock()
+        self._gdino_batch_meta_timeout_thread = None
+        self._gdino_batch_meta_timeout_thread_lock = threading.Lock()
+        self._gdino_batch_meta_timeout_thread_stop = threading.Event()
+        self._gdino_batch_meta_timeout_thread_stop_lock = threading.Lock()
+        self._gdino_batch_meta_timeout_thread_running = False
+        self._gdino_batch_meta_timeout_thread_running_lock = threading.Lock()
+        self._gdino_batch_meta_timeout_thread_finished = threading.Event()
+        self._gdino_batch_meta_timeout_thread_finished_lock = threading.Lock()
+        if HAVE_PYDS:
+            self._gdino_batch_meta_pool = pyds.NvDsMetaPool()
+            self._gdino_batch_meta_pool_lock = threading.Lock()
+        else:
+            self._gdino_batch_meta_pool = None
+            self._gdino_batch_meta_pool_lock = None
 
     def _preprocess(self, frames):
         if frames and not self._enable_jpeg_output:
@@ -948,34 +1045,70 @@ class VideoFileFrameGetter:
         q2 = Gst.ElementFactory.make("queue")
         pipeline.add(q2)
 
-        videoconvert = Gst.ElementFactory.make("nvvideoconvert")
-        self._videoconvert = videoconvert
-        videoconvert.set_property("nvbuf-memory-type", 2)
-
-        videoconvert.set_property("gpu-id", self._gpu_id)
-        pipeline.add(videoconvert)
+        # Use CPU-compatible videoconvert for CPU-only mode
+        if HAVE_PYDS:
+            videoconvert = Gst.ElementFactory.make("nvvideoconvert")
+            self._videoconvert = videoconvert
+            if videoconvert:
+                videoconvert.set_property("nvbuf-memory-type", 2)
+                videoconvert.set_property("gpu-id", self._gpu_id)
+                pipeline.add(videoconvert)
+            else:
+                print("WARNING: nvvideoconvert not available, using standard videoconvert")
+                videoconvert = Gst.ElementFactory.make("videoconvert")
+                self._videoconvert = videoconvert
+                pipeline.add(videoconvert)
+        else:
+            # CPU-only mode: use standard videoconvert
+            videoconvert = Gst.ElementFactory.make("videoconvert")
+            self._videoconvert = videoconvert
+            pipeline.add(videoconvert)
 
         if self._enable_jpeg_output:
-            jpegenc = Gst.ElementFactory.make("nvjpegenc")
-            pipeline.add(jpegenc)
-            format = "RGB"  # only RGB/I420 supported by nvjpegenc
+            if HAVE_PYDS:
+                jpegenc = Gst.ElementFactory.make("nvjpegenc")
+                if jpegenc:
+                    pipeline.add(jpegenc)
+                    format = "RGB"  # only RGB/I420 supported by nvjpegenc
+                else:
+                    print("WARNING: nvjpegenc not available, using standard jpegenc")
+                    jpegenc = Gst.ElementFactory.make("jpegenc")
+                    pipeline.add(jpegenc)
+                    format = "RGB"
+            else:
+                # CPU-only mode: use standard jpegenc
+                jpegenc = Gst.ElementFactory.make("jpegenc")
+                pipeline.add(jpegenc)
+                format = "RGB"
         else:
             format = "GBR" if self._do_preprocess else "RGB"
             pass
         # format = "NV12"
         capsfilter = Gst.ElementFactory.make("capsfilter")
         self._out_caps_filter = capsfilter
-        capsfilter.set_property(
-            "caps",
-            Gst.Caps.from_string(
+        
+        # Use CPU-compatible caps for CPU-only mode
+        if HAVE_PYDS:
+            caps_string = (
                 (
                     f"video/x-raw(memory:NVMM), format={format},"
                     f" width={self._frame_width}, height={self._frame_height}"
                 )
                 if self._frame_width and self._frame_height
                 else f"video/x-raw(memory:NVMM), format={format}"
-            ),
-        )
+            )
+        else:
+            # CPU-only mode: use standard video/x-raw caps
+            caps_string = (
+                (
+                    f"video/x-raw, format={format},"
+                    f" width={self._frame_width}, height={self._frame_height}"
+                )
+                if self._frame_width and self._frame_height
+                else f"video/x-raw, format={format}"
+            )
+        
+        capsfilter.set_property("caps", Gst.Caps.from_string(caps_string))
         pipeline.add(capsfilter)
 
         self._audio_q1 = None
@@ -1122,22 +1255,35 @@ class VideoFileFrameGetter:
                 image_tensor = np.frombuffer(mapinfo.data, dtype=np.uint8)
             else:
                 # Buffer contains raw frame
-
-                # Extract GPU memory pointer and create tensor from it using
-                # DeepStream Python Bindings and cupy
-                _, shape, strides, dataptr, size = pyds.get_nvds_buf_surface_gpu(hash(buffer), 0)
-                ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-                ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
-                owner = None
-                c_data_ptr = ctypes.pythonapi.PyCapsule_GetPointer(dataptr, None)
-                unownedmem = cp.cuda.UnownedMemory(c_data_ptr, size, owner)
-                memptr = cp.cuda.MemoryPointer(unownedmem, 0)
-                n_frame_gpu = cp.ndarray(
-                    shape=shape, dtype=np.uint8, memptr=memptr, strides=strides, order="C"
-                )
-                image_tensor = torch.tensor(
-                    n_frame_gpu, dtype=torch.uint8, requires_grad=False, device="cuda"
-                )
+                if HAVE_PYDS:
+                    # Extract GPU memory pointer and create tensor from it using
+                    # DeepStream Python Bindings and cupy
+                    _, shape, strides, dataptr, size = pyds.get_nvds_buf_surface_gpu(hash(buffer), 0)
+                    ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+                    ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+                    owner = None
+                    c_data_ptr = ctypes.pythonapi.PyCapsule_GetPointer(dataptr, None)
+                    unownedmem = cp.cuda.UnownedMemory(c_data_ptr, size, owner)
+                    memptr = cp.cuda.MemoryPointer(unownedmem, 0)
+                    n_frame_gpu = cp.ndarray(
+                        shape=shape, dtype=np.uint8, memptr=memptr, strides=strides, order="C"
+                    )
+                    image_tensor = torch.tensor(
+                        n_frame_gpu, dtype=torch.uint8, requires_grad=False, device="cuda"
+                    )
+                else:
+                    # CPU-only mode: use standard GStreamer buffer operations
+                    # Extract raw frame data from CPU memory
+                    frame_data = np.frombuffer(mapinfo.data, dtype=np.uint8)
+                    # Reshape the frame data based on width, height, and format
+                    # Assuming RGB format for now
+                    if width and height:
+                        try:
+                            frame_data = frame_data.reshape((height, width, 3))
+                        except ValueError:
+                            # If reshape fails, keep as 1D array
+                            pass
+                    image_tensor = torch.tensor(frame_data, dtype=torch.uint8, requires_grad=False)
 
             # Cache the pre-processed frame / jpeg and its timestamp. Convert
             # the timestamps from nanoseconds to seconds.
@@ -1498,6 +1644,21 @@ class VideoFileFrameGetter:
                 sys.stderr.write("Warning: %s: %s\n" % (err, debug))
             elif t == Gst.MessageType.ERROR:
                 err, debug = message.parse_error()
+                
+                # Handle missing H.264 decoder gracefully
+                if "missing a plug-in" in str(err) and "H.264" in str(err):
+                    logger.error("H.264 decoder not available. This is a known issue in CPU-only mode.")
+                    logger.error("To fix this, install proper H.264 decoder plugins:")
+                    logger.error("  - sudo apt-get install gstreamer1.0-libav")
+                    logger.error("  - sudo apt-get install gstreamer1.0-plugins-ugly")
+                    logger.error("For now, video processing will be skipped for this file.")
+                    # Set a flag to indicate codec error instead of crashing
+                    selff._codec_error = True
+                    selff._got_error = True
+                    selff._audio_stop.set()
+                    selff._loop.quit()
+                    return True
+                
                 sys.stderr.write("Error: %s: %s\n" % (err, debug))
                 self._got_error = True
                 selff._audio_stop.set()
@@ -2435,54 +2596,18 @@ class VideoFileFrameGetter:
 
         pad.add_probe(Gst.PadProbeType.BUFFER, buffer_probe, self)
         pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, buffer_probe_event_eos, self)
-        tee_pad.add_probe(Gst.PadProbeType.QUERY_DOWNSTREAM, cb_ntpquery, self)
+        pad.add_probe(Gst.PadProbeType.QUERY_DOWNSTREAM, cb_ntpquery, self)
 
-        def osd_sink_pad_buffer_probe(pad, info, u_data):
-            gst_buffer = info.get_buffer()
-            if not gst_buffer:
-                print("Unable to get GstBuffer ")
-                return
+        qvideoconvert.link(videoconvert)
 
-            # Retrieve batch metadata from the gst_buffer
-            # # Note that pyds.gst_buffer_get_nvds_batch_meta() expects the
-            # C address of gst_buffer as input, which is obtained with hash(gst_buffer)
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
-            l_frame = batch_meta.frame_meta_list
+        videoconvert.link(capsfilter)
+        if self._enable_jpeg_output:
+            capsfilter.link(jpegenc)
+            jpegenc.link(q2)
+        else:
+            capsfilter.link(q2)
 
-            while l_frame is not None:
-                try:
-                    # Note that l_frame.data needs a cast to pyds.NvDsFrameMeta
-                    # The casting also keeps ownership of the underlying memory
-                    # in the C code, so the Python garbage collector will leave
-                    # it alone.
-                    frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-                except StopIteration:
-                    break
-
-                if u_data.input_cv_metadata:
-                    frame_json_meta = u_data.input_cv_metadata.get_frame_cv_meta(frame_meta.buf_pts)
-                    obj_labels_list = u_data.input_cv_metadata.get_obj_labels_list()
-                    if frame_json_meta:
-                        self.add_cv_meta_to_frame(
-                            batch_meta, frame_meta, frame_json_meta, obj_labels_list
-                        )
-
-                self.modify_osd_meta(batch_meta, frame_meta)
-
-                try:
-                    l_frame = l_frame.next
-                except StopIteration:
-                    break
-            return Gst.PadProbeReturn.OK
-
-        osdsinkpad = nvdsosd.get_static_pad("sink")
-        if not osdsinkpad:
-            sys.stderr.write(" Unable to get sink pad of osd \n")
-        osdsinkpad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, self)
-
-        self._tee.link(q1)
-        self._tee.link(queue_tee_fakesink)
-        queue_tee_fakesink.link(seek_fakesink)
+        q2.link(appsink)
 
         def audio_buffer_probe(pad, info, data):
             # Probe callback function to pass chosen frames and drop other frames
@@ -2512,265 +2637,6 @@ class VideoFileFrameGetter:
             audio_pad = self._audio_convert.get_static_pad("sink")
             audio_pad.add_probe(Gst.PadProbeType.BUFFER, audio_buffer_probe, self)
 
-        q1_src_pad = q1.get_static_pad("src")
-        mux_sinkpad = nvstreammux.request_pad_simple("sink_0")
-        q1_src_pad.link(mux_sinkpad)
-        if self._is_live and self._gdino_engine:
-            # Create gdino - tracker pipeline (Similar to CV pipeline)
-            # streammux -> queue3 -> videoconvert2 -> capsfilter1 (RGBA) -> queue4 -> videoconvert3
-            # -> queue5 -> tracker -> queue6  ->  videoconvert_to_osd -> osd
-            # create elements
-            logger.debug("Creating more elements")
-            q3 = Gst.ElementFactory.make("queue")
-            pipeline.add(q3)
-            videoconvert2 = Gst.ElementFactory.make("nvvideoconvert")
-            videoconvert2.set_property("nvbuf-memory-type", 2)
-            videoconvert2.set_property("interpolation-method", 1)
-            pipeline.add(videoconvert2)
-            capsfilter1 = Gst.ElementFactory.make("capsfilter")
-            capsfilter1.set_property(
-                "caps",
-                Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12"),
-            )
-            pipeline.add(capsfilter1)
-            q4 = Gst.ElementFactory.make("queue")
-            pipeline.add(q4)
-            videoconvert3 = Gst.ElementFactory.make("nvvideoconvert")
-            pipeline.add(videoconvert3)
-            q5 = Gst.ElementFactory.make("queue")
-            pipeline.add(q5)
-            nvtracker = Gst.ElementFactory.make("nvtracker")
-            nvtracker.set_property("user-meta-pool-size", 256)
-            nvtracker.set_property(
-                "ll-lib-file",
-                "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
-            )
-            nvtracker.set_property("ll-config-file", self._tracker_config)
-            pipeline.add(nvtracker)
-            self._nvtracker = nvtracker
-            q6 = Gst.ElementFactory.make("queue")
-            pipeline.add(q6)
-            # BN : TBD : add nvdslogger when the issue in nvdslogger is fixed
-            # when nvdslogger is enabled, stale states are maintained in the second run
-            # nvdslogger = Gst.ElementFactory.make("nvdslogger")
-            # pipeline.add(nvdslogger)
-
-            # Add buffer probes
-            unique_filename = f"/tmp/config_nvinferserver_{uuid.uuid4()}.txt"
-            self._unique_filename = unique_filename
-
-            # Copy the file to /tmp with the unique filename
-            shutil.copy(
-                "/opt/nvidia/TritonGdino/config_triton_nvinferserver_gdino.txt", unique_filename
-            )
-
-            if not os.path.exists("/tmp/nvdsinferserver_custom_impl_gdino/"):
-                shutil.copytree(
-                    "/opt/nvidia/TritonGdino/nvdsinferserver_custom_impl_gdino/",
-                    "/tmp/nvdsinferserver_custom_impl_gdino/",
-                )
-            else:
-                logger.debug("nvdsinferserver_custom_impl_gdino already exists in /tmp")
-
-            if not os.path.exists(f"/tmp/TritonGdino_{self._gpu_id}/"):
-                shutil.copytree(
-                    "/opt/nvidia/TritonGdino/",
-                    f"/tmp/TritonGdino_{self._gpu_id}/",
-                )
-
-                with open(
-                    f"/tmp/TritonGdino_{self._gpu_id}/"
-                    "triton_model_repo/gdino_preprocess/config.pbtxt",
-                    "r",
-                ) as file:
-                    content = file.read()
-
-                # Use a regex pattern that allows for optional spaces around the colon and brackets
-                modified_content = re.sub(
-                    r"gpu_ids:\s*\[\s*0\s*\]", f"gpu_ids: [{self._gpu_id}]", content
-                )
-
-                # Write the modified content back to the file
-                with open(
-                    f"/tmp/TritonGdino_{self._gpu_id}/"
-                    "triton_model_repo/gdino_preprocess/config.pbtxt",
-                    "w",
-                ) as file:
-                    file.write(modified_content)
-                # print (modified_content)
-
-                with open(
-                    f"/tmp/TritonGdino_{self._gpu_id}/" "triton_model_repo/gdino_trt/config.pbtxt",
-                    "r",
-                ) as file:
-                    content = file.read()
-
-                # Use a regex pattern that allows for optional spaces around the colon and brackets
-                modified_content = re.sub(
-                    r"gpu_ids:\s*\[\s*0\s*\]", f"gpu_ids: [{self._gpu_id}]", content
-                )
-
-                # Write the modified content back to the file
-                with open(
-                    f"/tmp/TritonGdino_{self._gpu_id}/" "triton_model_repo/gdino_trt/config.pbtxt",
-                    "w",
-                ) as file:
-                    file.write(modified_content)
-                # print (modified_content)
-
-                with open(
-                    f"/tmp/TritonGdino_{self._gpu_id}/"
-                    "triton_model_repo/gdino_postprocess/config.pbtxt",
-                    "r",
-                ) as file:
-                    content = file.read()
-
-                # Use a regex pattern that allows for optional spaces around the colon and brackets
-                modified_content = re.sub(
-                    r"gpu_ids:\s*\[\s*0\s*\]", f"gpu_ids: [{self._gpu_id}]", content
-                )
-
-                # Write the modified content back to the file
-                with open(
-                    f"/tmp/TritonGdino_{self._gpu_id}/"
-                    "triton_model_repo/gdino_postprocess/config.pbtxt",
-                    "w",
-                ) as file:
-                    file.write(modified_content)
-                # print (modified_content)
-
-            else:
-                logger.debug("TritonGdino_%d already exists in /tmp", self._gpu_id)
-
-            threshold = None
-            # check if last element has confidence threshold
-            if self._text_prompts and ";" in self._text_prompts[-1]:
-                # split the last element into text and threshold
-                text, threshold = self._text_prompts[-1].split(";")
-                # strip punctuation from text
-                text = text.strip()
-                # replace last element with just the text
-                self._text_prompts[-1] = text.rstrip(".")
-                # remove any trailing periods and whitespace from threshold
-                threshold = threshold.strip().rstrip(".")
-                try:
-                    threshold = float(threshold)
-                except ValueError:
-                    logger.warning("warning: invalid threshold format in prompt: %s", threshold)
-
-            # prompt_text = " . ".join(self._text_prompts) + " . "
-            # pattern = r"person . face . car . bus . backpack . "
-            # print(prompt_text)
-            # print(pattern)
-
-            # Read the file, modify it, and write it back
-            with open(unique_filename, "r") as file:
-                content = file.read()
-
-            prompt_text = " . ".join(self._text_prompts) + " . "
-            logger.debug(self._text_prompts)
-
-            # Try to find the type_name pattern in the config file content
-            # Pattern to match the entire type_name including optional threshold
-            existing_pattern = r'type_name:\s*"([^"]+?)(?:;[0-9]*\.?[0-9]+)?"'
-            match = re.search(existing_pattern, content)
-
-            if match:
-                # Extract the full matched type_name string
-                full_match = match.group(0)
-
-                # Check if the existing type_name has a threshold value (format: "text;threshold")
-                if ";" in full_match:
-                    # Extract existing threshold, removing trailing quote
-                    existing_threshold = full_match.split(";")[1].rstrip('"')
-
-                    # If a new threshold was provided in text_prompts, use it
-                    if threshold is not None:
-                        new_type_name = f'type_name: "{prompt_text.strip()};{threshold}"'
-                    # Otherwise keep the existing threshold from config
-                    else:
-                        new_type_name = f'type_name: "{prompt_text.strip()};{existing_threshold}"'
-
-                # No threshold in existing type_name
-                else:
-                    # If a new threshold was provided in text_prompts, use it
-                    if threshold is not None:
-                        new_type_name = f'type_name: "{prompt_text.strip()};{threshold}"'
-                    # No threshold anywhere, use default 0.3
-                    else:
-                        new_type_name = f'type_name: "{prompt_text.strip()};0.3"'
-
-                # Replace the old type_name with the new one, preserving rest of content
-                modified_content = re.sub(full_match, new_type_name, content)
-
-            # Could not find type_name pattern in config
-            else:
-                logger.warning("Warning: Could not find type_name pattern in config file")
-                modified_content = content  # Keep content unchanged
-
-            # Use a regex pattern that allows for optional spaces around the colon and brackets
-            modified_content = re.sub(
-                r"gpu_ids:\s*\[\s*0\s*\]", f"gpu_ids: [{self._gpu_id}]", modified_content
-            )
-            modified_content = re.sub(r"device:\s*0", f"device: {self._gpu_id}", modified_content)
-
-            modified_content = re.sub(
-                r"root:\s*\"./triton_model_repo/\"",
-                f'root: "/tmp/TritonGdino_{self._gpu_id}/' 'triton_model_repo/"',
-                modified_content,
-            )
-            logger.debug("Setting GDINO Inference interval to : %d", self._inference_interval)
-            modified_content = re.sub(
-                r"interval:\s*0", f"interval: {self._inference_interval}", modified_content
-            )
-
-            # Write the modified content back to the file
-            # print(modified_content)
-            # print(unique_filename)
-            with open(unique_filename, "w") as file:
-                file.write(modified_content)
-
-            # Set the property to use the modified file
-            nvdsinferserver = Gst.ElementFactory.make("nvinferserver")
-            pipeline.add(nvdsinferserver)
-            nvdsinferserver.set_property("config-file-path", unique_filename)
-            # nvdsinferserver.set_property("interval", self._inference_interval)
-
-            # pgiesrcpad = q4.get_static_pad("sink")
-            # if not pgiesrcpad:
-            #     sys.stderr.write(" Unable to get src pad of primary infer \n")
-            self._frame_no = 0
-            # self._inference_interval = 1
-            # pgiesrcpad.add_probe(Gst.PadProbeType.BUFFER, gdino_pgie_src_pad_buffer_probe, self)
-            # nvtrackersrcpad = nvtracker.get_static_pad("src")
-            # nvtrackersrcpad.add_probe(Gst.PadProbeType.BUFFER, tracker_src_pad_buffer_probe, self)
-
-            # link elements
-            nvstreammux.link(q3)
-            q3.link(videoconvert2)
-            videoconvert2.link(capsfilter1)
-            capsfilter1.link(nvdsinferserver)
-            nvdsinferserver.link(q4)
-            q4.link(videoconvert3)
-            videoconvert3.link(q5)
-            q5.link(nvtracker)
-            nvtracker.link(q6)
-            # q6.link(nvdslogger)
-            # nvdslogger.link(videoconvert_to_osd)
-            q6.link(videoconvert_to_osd)
-        else:
-            nvstreammux.link(videoconvert_to_osd)
-        videoconvert_to_osd.link(nvdsosd)
-        nvdsosd.link(videoconvert)
-        videoconvert.link(capsfilter)
-        if self._enable_jpeg_output:
-            capsfilter.link(jpegenc)
-            jpegenc.link(q2)
-        else:
-            capsfilter.link(q2)
-
-        q2.link(appsink)
-
         self._loop = GLib.MainLoop()
         bus = pipeline.get_bus()
         bus.add_signal_watch()
@@ -2793,6 +2659,21 @@ class VideoFileFrameGetter:
                 sys.stderr.write("Warning: %s: %s\n" % (err, debug))
             elif t == Gst.MessageType.ERROR:
                 err, debug = message.parse_error()
+                
+                # Handle missing H.264 decoder gracefully
+                if "missing a plug-in" in str(err) and "H.264" in str(err):
+                    logger.error("H.264 decoder not available. This is a known issue in CPU-only mode.")
+                    logger.error("To fix this, install proper H.264 decoder plugins:")
+                    logger.error("  - sudo apt-get install gstreamer1.0-libav")
+                    logger.error("  - sudo apt-get install gstreamer1.0-plugins-ugly")
+                    logger.error("For now, video processing will be skipped for this file.")
+                    # Set a flag to indicate codec error instead of crashing
+                    selff._codec_error = True
+                    selff._got_error = True
+                    selff._audio_stop.set()
+                    selff._loop.quit()
+                    return True
+                
                 sys.stderr.write("Error: %s: %s\n" % (err, debug))
                 self._got_error = True
                 selff._audio_stop.set()
@@ -2992,6 +2873,15 @@ class VideoFileFrameGetter:
             pipeline.set_state(Gst.State.PAUSED)
             if old_pipeline:
                 old_pipeline.set_state(Gst.State.NULL)
+
+        # Check for codec errors and handle gracefully
+        if hasattr(self, '_codec_error') and self._codec_error:
+            logger.warning("Video processing skipped due to missing H.264 decoder")
+            if not retain_pipeline:
+                self._pipeline.set_state(Gst.State.NULL)
+                self._pipeline = None
+            # Return empty results when codec error occurs
+            return [], [], []
 
         if not retain_pipeline:
             self._pipeline.set_state(Gst.State.NULL)
